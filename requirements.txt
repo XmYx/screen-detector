@@ -1,0 +1,11 @@
+# torch/torchvision are installed by run.py (CUDA wheel picked automatically)
+ultralytics>=8.4
+PyQt6>=6.7
+numpy
+opencv-python
+mss>=9.0
+# text encoder for open-vocabulary (yoloe) models; zip URL so no git is needed (e.g. on Windows)
+clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/main.zip
+dxcam; sys_platform == "win32"
+# Linux/Wayland capture uses distro packages instead of pip:
+#   sudo apt install python3-gi python3-dbus gir1.2-gstreamer-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-base

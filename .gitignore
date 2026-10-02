@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+*.pt
+*.ts
+*.onnx
+*.engine
+dataset/
+examples/
+config.json
+dist/
+*.zip
