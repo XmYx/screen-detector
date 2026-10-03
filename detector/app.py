@@ -27,7 +27,8 @@ def main(args: list[str]) -> int:
     import numpy as np
 
     from .capture import create_capture, resolve_backend
-    from .engine import OPEN_VOCAB_HINTS, FrameResult, InferenceWorker
+    from .alerts import SoundAlert
+    from .engine import FrameResult, InferenceWorker
     from .examples import ExampleStore
     from .overlay import Overlay
     from .panel import Panel
@@ -44,6 +45,8 @@ def main(args: list[str]) -> int:
             self.store = ExampleStore()
             self.panel = Panel(settings, self.store)
             self._selector = None
+            self._image_queue: list[str] = []
+            self.sound = SoundAlert(settings)
             self.worker = InferenceWorker(settings)
 
             self.worker.result.connect(self.on_result)
@@ -57,7 +60,9 @@ def main(args: list[str]) -> int:
             self.panel.snapshot.connect(self.worker.request_snapshot)
             self.panel.quit_requested.connect(app.quit)
             self.panel.pick_screen.connect(self.pick_from_screen)
-            self.panel.pick_image.connect(self.pick_from_file)
+            self.panel.pick_images.connect(self.pick_from_files)
+            self.panel.test_sound.connect(self.sound.play)
+            self.worker.learned.connect(lambda msg: self.overlay.toast(msg[:1].upper() + msg[1:]))
             self.panel.paste_image.connect(self.pick_from_clipboard)
             self.panel.examples_changed.connect(self.worker.request_examples)
             self._make_tray()
@@ -151,13 +156,24 @@ def main(args: list[str]) -> int:
                     self.panel.show()
             self._select(frame.copy(), label, mode, self.overlay.geometry(), True, restore)
 
-        def pick_from_file(self, path: str, label: str, mode: str) -> None:
-            data = np.fromfile(path, np.uint8)  # imread cannot open non-ASCII paths on Windows
-            img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
-            if img is None:
-                self.panel.set_status(f"⚠ could not read image {path}")
+        def pick_from_files(self, paths: list, label: str, mode: str) -> None:
+            """Several reference images: box each one in turn (Enter = whole image)."""
+            self._image_queue = list(paths)
+            self._next_image(label, mode)
+
+        def _next_image(self, label: str, mode: str) -> None:
+            while self._image_queue:
+                path = self._image_queue.pop(0)
+                data = np.fromfile(path, np.uint8)  # imread cannot open non-ASCII paths on Windows
+                img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+                if img is None:
+                    self.panel.set_status(f"⚠ could not read image {path}")
+                    continue
+                left = len(self._image_queue)
+                self._select(img, label, mode, self.panel.screen().geometry(), False,
+                             lambda: self._next_image(label, mode),
+                             extra=f" · {left} more after this" if left else "")
                 return
-            self._select(img, label, mode, self.panel.screen().geometry(), False, lambda: None)
 
         def pick_from_clipboard(self, label: str, mode: str) -> None:
             qimg = self.app.clipboard().image()
@@ -166,9 +182,9 @@ def main(args: list[str]) -> int:
                 return
             self._select(qimage_to_bgr(qimg), label, mode, self.panel.screen().geometry(), False, lambda: None)
 
-        def _select(self, img, label, mode, geometry, fullscreen, done) -> None:
-            kind = "similar objects" if mode == "similar" else "exact look"
-            sel = BoxSelector(img, f"Example “{label}” ({kind})", geometry, fullscreen)
+        def _select(self, img, label, mode, geometry, fullscreen, done, extra: str = "") -> None:
+            kind = {"auto": "all methods", "similar": "look-alike", "exact": "exact look"}.get(mode, mode)
+            sel = BoxSelector(img, f"Example “{label}” ({kind}){extra}", geometry, fullscreen)
             sel.selected.connect(lambda box: (self._add_example(img, box, label, mode), done()))
             sel.cancelled.connect(done)
             self._selector = sel
@@ -182,10 +198,10 @@ def main(args: list[str]) -> int:
                 return
             self.panel.refresh_examples()
             self.worker.request_examples()
-            stem = self.settings.model.lower()
-            if mode == "similar" and (not any(h in stem for h in OPEN_VOCAB_HINTS) or "-pf" in stem):
-                self.panel.set_status("⚠ 'similar' examples need a yoloe model (switch Model to yoloe-26s-seg.pt); "
-                                      "'exact look' works with any model")
+            n = sum(1 for e in self.store.items if e.label == label)
+            msg = f"Learning example “{label}” ({n} image{'s' if n > 1 else ''} for this label) …"
+            self.panel.set_status(msg)
+            self.overlay.toast(msg)
 
         def forget_screen(self) -> None:
             self.settings.restore_token = ""
@@ -196,6 +212,7 @@ def main(args: list[str]) -> int:
             self.overlay.capture_fps = fps
             self.overlay.set_result(r)
             self.panel.update_stats(r, fps)
+            self.sound.update(r)
 
         def poll(self) -> None:
             cap = self.capture

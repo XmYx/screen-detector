@@ -4,6 +4,8 @@ PyQt6>=6.7
 numpy
 opencv-python
 mss>=9.0
+# DINOv2 similarity check for detect-by-example
+transformers>=4.40
 # text encoder for open-vocabulary (yoloe) models; zip URL so no git is needed (e.g. on Windows)
 clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/main.zip
 dxcam; sys_platform == "win32"

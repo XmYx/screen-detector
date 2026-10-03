@@ -30,16 +30,32 @@ class Settings:
     max_fps: int = 60
     fp16: bool = True
     paused: bool = False
-    # detect-by-example (examples/)
-    example_conf: float = 0.15    # "similar" visual-prompt scores run lower than text-prompt ones
-    exact_thresh: float = 0.80    # correlation needed for an "exact look" template match
+    small_objects: bool = False   # also run on 2x2 zoomed tiles: finds small / far away objects, ~2-3x slower
+    # detect-by-example (examples/): every enabled method runs, results are fused per label
+    ex_vp: bool = True            # YOLOE visual prompt per example image
+    ex_text: bool = True          # the example label as a YOLOE text prompt
+    ex_template: bool = True      # multi-scale template matching
+    ex_verify: bool = True        # DINOv2 similarity check against the example images
+    ex_similar: bool = True       # similarity search: also show other objects that look like an example
+    similar_thresh: float = 0.55  # DINOv2 similarity needed for the similarity search
+    match_thresh: float = 0.45    # fused confidence needed to show an example match
     example_color: str = "#ffb020"
     # overlay
+    overlay_mode: str = "boxes"   # boxes | corners | neon | markers | spotlight | heatmap
+    overlay_opacity: float = 1.0
+    color_by_label: bool = False
+    heat_palette: str = "turbo"
     show_labels: bool = True
     show_conf: bool = True
     show_hud: bool = True
     box_color: str = "#00ff66"
     box_thickness: int = 2
+    # sound alert when something is detected
+    sound_enabled: bool = False
+    sound_file: str = ""          # empty = built-in pling
+    sound_volume: float = 0.7
+    sound_cooldown: float = 2.0   # minimum seconds between alerts
+    sound_labels: str = ""        # only alert for these labels (comma separated), empty = any
     # capture
     backend: str = "auto"         # auto | pipewire | dxgi | mss
     monitor: int = 0

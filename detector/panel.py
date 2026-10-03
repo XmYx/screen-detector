@@ -11,14 +11,14 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractButton, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QGraphicsOpacityEffect,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider,
-    QSpinBox, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .capture import available_backends
 from .config import BUILTIN_MODELS, DATASET_DIR, MODELS_DIR, Settings
 from .engine import FrameResult
 from .examples import ExampleStore
-from .overlay import exclude_from_capture
+from .overlay import MODES as OVERLAY_MODES, PALETTES, exclude_from_capture
 from .picker import bgr_to_qimage
 
 IMG_SIZES = [320, 416, 480, 640, 800, 960, 1280, 1600, 1920]
@@ -60,6 +60,10 @@ QMenu::item:selected {{ background: rgba(61,220,132,0.25); }}
 QListWidget {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }}
 QListWidget::item {{ color: #c9d1d9; border-radius: 6px; padding: 2px; }}
 QListWidget::item:selected {{ background: rgba(61,220,132,0.22); }}
+QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 6px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: rgba(255,255,255,0.18); border-radius: 3px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ height: 0; background: none; }}
 """
 
 
@@ -198,7 +202,8 @@ class Panel(QWidget):
     quit_requested = pyqtSignal()
     hide_requested = pyqtSignal()
     pick_screen = pyqtSignal(str, str)       # label, mode
-    pick_image = pyqtSignal(str, str, str)   # path, label, mode
+    pick_images = pyqtSignal(list, str, str)  # paths, label, mode
+    test_sound = pyqtSignal()
     paste_image = pyqtSignal(str, str)       # label, mode
     examples_changed = pyqtSignal()
 
@@ -219,14 +224,16 @@ class Panel(QWidget):
         root.setContentsMargins(14, 0, 14, 0)
         root.setSpacing(0)
         root.addWidget(self._build_header())
-        self.clip = QWidget()  # its height animates; the body inside keeps its natural size and is clipped
+        self.clip = QWidget()  # its height animates; the scroll area inside keeps its size and is clipped
         self.body = self._build_body()
-        self.body.setParent(self.clip)
-        self.body_fx = QGraphicsOpacityEffect(self.body)
-        self.body.setGraphicsEffect(self.body_fx)
+        self.scroll = QScrollArea(self.clip)
+        self.scroll.setWidget(self.body)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body_fx = QGraphicsOpacityEffect(self.scroll)
+        self.scroll.setGraphicsEffect(self.body_fx)
         root.addWidget(self.clip)
-        self._body_h = self.body.sizeHint().height()
-        self.body.setGeometry(0, 0, WIDTH - 28, self._body_h)
+        self._layout_body()
 
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(ANIM_MS)
@@ -297,7 +304,7 @@ class Panel(QWidget):
         self._section(g, "Detect")
         row = QHBoxLayout()
         self.targets = QLineEdit(s.targets)
-        self.targets.setPlaceholderText("cat, dog …  (empty = everything)")
+        self.targets.setPlaceholderText("any words: person, face, chest …  (empty = all)")
         self.targets.returnPressed.connect(self._apply_targets)
         b = QPushButton("Apply")
         b.setProperty("accent", True)
@@ -339,6 +346,9 @@ class Panel(QWidget):
         self._row(g, "Input size", row)
         row = QHBoxLayout()
         row.addWidget(self._toggle("FP16", "fp16"))
+        small = self._toggle("Small objects", "small_objects")
+        small.setToolTip("Also scan zoomed 2x2 tiles: finds small / far away objects (slower)")
+        row.addWidget(small)
         self.pause = self._toggle("Pause", "paused")
         row.addWidget(self.pause)
         row.addStretch()
@@ -349,10 +359,12 @@ class Panel(QWidget):
         self.ex_label = QLineEdit()
         self.ex_label.setPlaceholderText("label, e.g. chest")
         self.ex_mode = QComboBox()
+        self.ex_mode.addItem("Auto (all methods)", "auto")
         self.ex_mode.addItem("Similar (AI)", "similar")
         self.ex_mode.addItem("Exact look", "exact")
-        self.ex_mode.setToolTip("Similar: objects that look alike (characters, chests, animals; needs a yoloe model)\n"
-                                "Exact look: icons, markers, UI and sprites that always look the same (any model)")
+        self.ex_mode.setToolTip("Auto: every method runs and the results are combined (recommended)\n"
+                                "Similar: look-alike objects only (characters, chests, animals)\n"
+                                "Exact look: icons, markers, UI and sprites that always look the same")
         row.addWidget(self.ex_label, 1)
         row.addWidget(self.ex_mode)
         self._row(g, "New", row)
@@ -362,7 +374,8 @@ class Panel(QWidget):
         b.setToolTip("Freeze the screen and drag a box around the thing to find")
         b.clicked.connect(lambda: self.pick_screen.emit(*self._new_example()))
         row.addWidget(b, 1)
-        b = QPushButton("Image…")
+        b = QPushButton("Images…")
+        b.setToolTip("Load one or more reference images")
         b.clicked.connect(self._choose_image)
         row.addWidget(b)
         b = QPushButton("Paste")
@@ -382,21 +395,57 @@ class Panel(QWidget):
         self.ex_list.itemChanged.connect(self._example_toggled)
         QShortcut(QKeySequence("Delete"), self.ex_list, activated=self._remove_selected)
         self._row(g, "", self.ex_list)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("similar ≥"))
-        row.addWidget(self._dspin(0.01, 0.95, s.example_conf, "example_conf"))
-        row.addWidget(QLabel("exact ≥"))
-        row.addWidget(self._dspin(0.3, 0.99, s.exact_thresh, "exact_thresh"))
-        row.addStretch()
-        self._row(g, "Thresholds", row)
+        tip = QLabel("Tip: add 2-5 examples per label from different angles, sizes and lighting.")
+        tip.setWordWrap(True)
+        tip.setProperty("role", "hint")
+        self._row(g, "", tip)
+        methods = [("Look-alike AI", "ex_vp", "YOLOE visual prompt from every example image"),
+                   ("Label text", "ex_text", "Also search for the label name as text (e.g. 'car')"),
+                   ("Template", "ex_template", "Exact-look matching at many sizes (icons, markers, UI)"),
+                   ("Verify", "ex_verify", "DINOv2 check: boosts candidates that look like the examples, "
+                                           "rejects ones that clearly do not"),
+                   ("Similar search", "ex_similar", "Also show other objects that look like an example "
+                                                    "(other models / colours / variants)")]
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        for i, (text, attr, tip_text) in enumerate(methods):
+            t = self._toggle(text, attr, relearn=True)
+            t.setToolTip(tip_text)
+            grid.addWidget(t, i // 2, i % 2)
+        self._row(g, "Methods", grid)
+        row, self.match_lbl = self._slider(10, 95, round(s.match_thresh * 100), self._match_changed,
+                                           f"{s.match_thresh:.2f}")
+        self._row(g, "Match ≥", row)
+        row, self.sim_lbl = self._slider(30, 90, round(s.similar_thresh * 100), self._similar_changed,
+                                         f"{s.similar_thresh:.2f}")
+        self._row(g, "Similar ≥", row)
         self.refresh_examples()
 
         self._section(g, "Overlay")
         row = QHBoxLayout()
-        row.addWidget(self._toggle("Labels", "show_labels"))
-        row.addWidget(self._toggle("Scores", "show_conf"))
-        row.addWidget(self._toggle("HUD", "show_hud"))
-        self._row(g, "", row)
+        self.ov_mode = QComboBox()
+        for m in OVERLAY_MODES:
+            self.ov_mode.addItem(m.capitalize(), m)
+        self.ov_mode.setCurrentIndex(max(0, OVERLAY_MODES.index(s.overlay_mode) if s.overlay_mode in OVERLAY_MODES else 0))
+        self.ov_mode.currentIndexChanged.connect(self._overlay_mode_changed)
+        self.palette = QComboBox()
+        self.palette.addItems(list(PALETTES))
+        self.palette.setCurrentText(s.heat_palette)
+        self.palette.setToolTip("Heatmap colour palette")
+        self.palette.currentTextChanged.connect(lambda t: setattr(s, "heat_palette", t))
+        self.palette.setEnabled(s.overlay_mode == "heatmap")
+        row.addWidget(self.ov_mode, 1)
+        row.addWidget(self.palette)
+        self._row(g, "Style", row)
+        row, self.ov_opacity_lbl = self._slider(10, 100, round(s.overlay_opacity * 100), self._ov_opacity_changed,
+                                                f"{round(s.overlay_opacity * 100)}%")
+        self._row(g, "Opacity", row)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        for i, (text, attr) in enumerate([("Labels", "show_labels"), ("Scores", "show_conf"), ("HUD", "show_hud"),
+                                          ("Colour per label", "color_by_label")]):
+            grid.addWidget(self._toggle(text, attr), i // 2, i % 2)
+        self._row(g, "", grid)
         row = QHBoxLayout()
         self.color_btn = QPushButton()
         self.color_btn.setFixedSize(46, 26)
@@ -410,6 +459,41 @@ class Panel(QWidget):
         row, self.opacity_lbl = self._slider(30, 100, round(s.panel_opacity * 100), self._opacity_changed,
                                              f"{round(s.panel_opacity * 100)}%")
         self._row(g, "Panel", row)
+
+        self._section(g, "Alerts")
+        row = QHBoxLayout()
+        row.addWidget(self._toggle("Sound", "sound_enabled"))
+        self.sound_btn = QPushButton()
+        self.sound_btn.setToolTip("Choose the sound file (WAV / MP3 / OGG). Right-click: back to the built-in pling")
+        self.sound_btn.clicked.connect(self._choose_sound)
+        self.sound_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sound_btn.customContextMenuRequested.connect(lambda _: self._set_sound(""))
+        self._set_sound(s.sound_file)
+        row.addWidget(self.sound_btn, 1)
+        b = QPushButton("▶")
+        b.setFixedWidth(34)
+        b.setToolTip("Test the sound")
+        b.clicked.connect(self.test_sound)
+        row.addWidget(b)
+        self._row(g, "", row)
+        row, self.vol_lbl = self._slider(0, 100, round(s.sound_volume * 100), self._volume_changed,
+                                         f"{round(s.sound_volume * 100)}%")
+        self._row(g, "Volume", row)
+        row = QHBoxLayout()
+        cd = QDoubleSpinBox()
+        cd.setRange(0, 60)
+        cd.setDecimals(1)
+        cd.setSuffix(" s")
+        cd.setValue(s.sound_cooldown)
+        cd.setFixedWidth(64)
+        cd.setToolTip("Minimum time between two alerts")
+        cd.valueChanged.connect(lambda v: setattr(s, "sound_cooldown", v))
+        row.addWidget(cd)
+        only = QLineEdit(s.sound_labels)
+        only.setPlaceholderText("only for labels… (empty = any)")
+        only.textChanged.connect(lambda t: setattr(s, "sound_labels", t))
+        row.addWidget(only, 1)
+        self._row(g, "Cooldown", row)
 
         self._section(g, "Capture")
         row = QHBoxLayout()
@@ -493,10 +577,12 @@ class Panel(QWidget):
         sp.valueChanged.connect(on_change)
         return sp
 
-    def _toggle(self, text: str, attr: str) -> Toggle:
+    def _toggle(self, text: str, attr: str, relearn: bool = False) -> Toggle:
         t = Toggle(text)
         t.setChecked(getattr(self.settings, attr))
         t.toggled.connect(lambda v: setattr(self.settings, attr, v))
+        if relearn:
+            t.toggled.connect(lambda _: self.examples_changed.emit())
         return t
 
     def _fill_models(self) -> None:
@@ -512,9 +598,9 @@ class Panel(QWidget):
         return self.ex_label.text().strip() or "object", self.ex_mode.currentData()
 
     def _choose_image(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Example image", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
-        if path:
-            self.pick_image.emit(path, *self._new_example())
+        paths, _ = QFileDialog.getOpenFileNames(self, "Example images", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if paths:
+            self.pick_images.emit(paths, *self._new_example())
 
     def refresh_examples(self) -> None:
         self.ex_list.blockSignals(True)
@@ -575,8 +661,7 @@ class Panel(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         self.settings.panel_collapsed = collapsed
         if not collapsed:
-            self._body_h = self.body.sizeHint().height()
-            self.body.setGeometry(0, 0, WIDTH - 28, self._body_h)
+            self._layout_body()
         self._anchor = self.geometry().topRight()
         self._anim.stop()
         self._anim.setStartValue(self._progress)
@@ -596,6 +681,13 @@ class Panel(QWidget):
         if self._anchor is not None:
             self.move(self._anchor.x() - w + 1, self._anchor.y())
         self.update()
+
+    def _layout_body(self) -> None:
+        """Body height = its content, capped to the screen (the rest scrolls)."""
+        screen = self.screen().availableGeometry() if self.screen() else None
+        cap = (screen.height() - HEADER_H - 90) if screen else 900
+        self._body_h = max(120, min(self.body.sizeHint().height(), cap))
+        self.scroll.setGeometry(0, 0, WIDTH - 28, self._body_h)
 
     def place(self, top_right: QPoint) -> None:
         self._anchor = top_right
@@ -684,6 +776,36 @@ class Panel(QWidget):
         self.settings.conf = v / 100
         self.conf_lbl.setText(f"{v / 100:.2f}")
 
+    def _match_changed(self, v: int) -> None:
+        self.settings.match_thresh = v / 100
+        self.match_lbl.setText(f"{v / 100:.2f}")
+
+    def _similar_changed(self, v: int) -> None:
+        self.settings.similar_thresh = v / 100
+        self.sim_lbl.setText(f"{v / 100:.2f}")
+
+    def _overlay_mode_changed(self, _: int) -> None:
+        self.settings.overlay_mode = self.ov_mode.currentData()
+        self.palette.setEnabled(self.settings.overlay_mode == "heatmap")
+
+    def _ov_opacity_changed(self, v: int) -> None:
+        self.settings.overlay_opacity = v / 100
+        self.ov_opacity_lbl.setText(f"{v}%")
+
+    def _volume_changed(self, v: int) -> None:
+        self.settings.sound_volume = v / 100
+        self.vol_lbl.setText(f"{v}%")
+
+    def _choose_sound(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Alert sound", "", "Sounds (*.wav *.mp3 *.ogg *.flac *.m4a)")
+        if path:
+            self._set_sound(path)
+
+    def _set_sound(self, path: str) -> None:
+        from pathlib import Path
+        self.settings.sound_file = path
+        self.sound_btn.setText(f"♪ {Path(path).name}" if path else "♪ Built-in pling")
+
     def _opacity_changed(self, v: int) -> None:
         self.settings.panel_opacity = v / 100
         self.opacity_lbl.setText(f"{v}%")
@@ -724,7 +846,7 @@ class Panel(QWidget):
             self.vocab.setText("Open vocabulary: type any object names.")
             self.vocab.setToolTip("")
         else:
-            self.vocab.setText(f"{len(names)} known classes (hover) · yoloe = any name")
+            self.vocab.setText(f"{len(names)} classes in this model (hover) · other words use open-vocabulary AI")
             self.vocab.setToolTip(", ".join(names[:400]))
 
     def update_stats(self, r: FrameResult, capture_fps: float) -> None:
